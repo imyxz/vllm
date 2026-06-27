@@ -179,6 +179,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
+from vllm.v1.spec_decode.dspark import DSparkProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
@@ -556,6 +557,7 @@ class GPUModelRunner(
                 | ExtractHiddenStatesProposer
                 | Gemma4Proposer
                 | Step3p5MTPProposer
+                | DSparkProposer
             )
             if self.speculative_config.method == "custom_class":
                 self.drafter = create_custom_proposer(  # type: ignore[assignment]
@@ -592,6 +594,8 @@ class GPUModelRunner(
                 self.drafter = Gemma4Proposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_step3p5_mtp():
                 self.drafter = Step3p5MTPProposer(self.vllm_config, self.device, self)
+            elif self.speculative_config.use_dspark_mtp():
+                self.drafter = DSparkProposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_dflash():
                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
                 self.use_aux_hidden_state_outputs = True
@@ -5050,12 +5054,16 @@ class GPUModelRunner(
                 )
 
             # Let the target override the hidden state fed to the drafter
-            # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). Safe to
+            # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual; DSpark needs
+            # the concatenated mean-pooled target-layer hidden states). Safe to
             # rebind here: hidden_states was already consumed for sampling
             # above and is not used again in this branch.
-            alt = getattr(
-                self.get_model(), "get_mtp_target_hidden_states", lambda: None
-            )()
+            alt_getter = (
+                "get_dspark_target_hidden_states"
+                if isinstance(self.drafter, DSparkProposer)
+                else "get_mtp_target_hidden_states"
+            )
+            alt = getattr(self.get_model(), alt_getter, lambda: None)()
             if alt is not None:
                 hidden_states = alt
 
