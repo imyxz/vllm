@@ -41,6 +41,82 @@ RADIX_TOPK_WORKSPACE_SIZE = 1024 * 1024
 MXFP4_BLOCK_SIZE = 32
 
 
+def _use_torch_mqa_logits_fallback(use_fp4_cache: bool) -> bool:
+    return (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+        and not use_fp4_cache
+    )
+
+
+def _torch_fp8_mqa_logits(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    kv_scale: torch.Tensor,
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+) -> torch.Tensor:
+    """Slow FP8 MQA logits fallback for GB10 indexer validation."""
+    q_f = q.to(torch.float32)
+    kv_f = kv.to(torch.float32) * kv_scale.to(torch.float32).unsqueeze(-1)
+    scores = torch.einsum("mhd,nd->mhn", q_f, kv_f)
+    logits = (scores.relu() * weights.to(torch.float32).unsqueeze(-1)).sum(dim=1)
+    kv_positions = torch.arange(kv.shape[0], device=kv.device, dtype=torch.int32)
+    mask = (kv_positions.unsqueeze(0) >= cu_seqlen_ks.unsqueeze(1)) & (
+        kv_positions.unsqueeze(0) < cu_seqlen_ke.unsqueeze(1)
+    )
+    return logits.masked_fill(~mask, float("-inf"))
+
+
+def _torch_fp8_paged_mqa_logits(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_table: torch.Tensor,
+    max_model_len: int,
+) -> torch.Tensor:
+    """Slow paged FP8 MQA logits fallback for GB10 indexer validation."""
+    batch_size, next_n, num_heads, head_dim = q.shape
+    block_size = kv_cache.shape[1]
+    rows = batch_size * next_n
+    logits = torch.full(
+        (rows, max_model_len),
+        float("-inf"),
+        device=q.device,
+        dtype=torch.float32,
+    )
+
+    raw_cache = kv_cache.squeeze(2)
+    kv_values = raw_cache[..., :head_dim].contiguous().view(current_platform.fp8_dtype())
+    kv_scales = (
+        raw_cache[..., head_dim : head_dim + 4]
+        .contiguous()
+        .view(torch.float32)
+        .squeeze(-1)
+    )
+    q_f = q.to(torch.float32)
+    weights_f = weights.to(torch.float32)
+
+    for batch_idx in range(batch_size):
+        for next_idx in range(next_n):
+            row = batch_idx * next_n + next_idx
+            context_len = int(context_lens[batch_idx, next_idx].item())
+            if context_len <= 0:
+                continue
+            num_blocks = (context_len + block_size - 1) // block_size
+            physical_blocks = block_table[batch_idx, :num_blocks].to(torch.long)
+            k_fp8 = kv_values[physical_blocks].reshape(-1, head_dim)[:context_len]
+            k_scale = kv_scales[physical_blocks].reshape(-1)[:context_len]
+            k_f = k_fp8.to(torch.float32) * k_scale.to(torch.float32).unsqueeze(-1)
+            scores = torch.matmul(q_f[batch_idx, next_idx], k_f.T)
+            logits[row, :context_len] = (
+                scores.relu() * weights_f[row].unsqueeze(-1)
+            ).sum(dim=0)
+    return logits
+
+
 @triton.jit
 def _fused_indexer_q_rope_quant_kernel(
     positions,
@@ -349,7 +425,16 @@ def sparse_attn_indexer(
                 q_slice_cast = q_slice
                 k_quant_cast = k_quant
                 k_scale_cast = k_scale.view(torch.float32).squeeze(-1)
-            if current_platform.is_xpu():
+            if _use_torch_mqa_logits_fallback(use_fp4_cache):
+                logits = _torch_fp8_mqa_logits(
+                    q_slice_cast,
+                    k_quant_cast,
+                    k_scale_cast,
+                    weights[chunk.token_start : chunk.token_end],
+                    chunk.cu_seqlen_ks,
+                    chunk.cu_seqlen_ke,
+                )
+            elif current_platform.is_xpu():
                 if q_scale_slice is not None:
                     raise RuntimeError("XPU fp8_mqa_logits does not support FP4 Q")
                 logits = torch.ops.vllm.xpu_fp8_mqa_logits(
@@ -436,7 +521,16 @@ def sparse_attn_indexer(
             if use_fp4_cache
             else padded_q_quant_decode_tokens
         )
-        if current_platform.is_xpu():
+        if _use_torch_mqa_logits_fallback(use_fp4_cache):
+            logits = _torch_fp8_paged_mqa_logits(
+                padded_q_quant_cast,
+                kv_cache,
+                weights[:num_padded_tokens],
+                seq_lens,
+                decode_metadata.block_table,
+                max_model_len,
+            )
+        elif current_platform.is_xpu():
             if padded_q_scale is not None:
                 raise RuntimeError("XPU fp8_paged_mqa_logits does not support FP4 Q")
             seq_lens_xpu = (
@@ -467,15 +561,16 @@ def sparse_attn_indexer(
 
         use_cooperative_topk = (
             current_platform.is_cuda()
+            and not current_platform.is_device_capability_family(120)
             and topk_tokens in (512, 1024, 2048)
             and num_rows <= 32
             and logits.stride(0) % 4 == 0  # TMA 16-byte alignment
             and current_platform.has_device_capability(90)
         )
-        use_persistent_topk = current_platform.is_cuda() and topk_tokens in (
-            512,
-            1024,
-            2048,
+        use_persistent_topk = (
+            current_platform.is_cuda()
+            and not current_platform.is_device_capability_family(120)
+            and topk_tokens in (512, 1024, 2048)
         )
         if use_cooperative_topk:
             workspace_manager = current_workspace_manager()

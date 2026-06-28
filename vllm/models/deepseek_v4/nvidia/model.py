@@ -65,6 +65,9 @@ from vllm.models.deepseek_v4.nvidia.flashinfer_sparse import (
     DeepseekV4FlashInferSM120Attention,
 )
 from vllm.models.deepseek_v4.nvidia.flashmla import DeepseekV4FlashMLAAttention
+from vllm.models.deepseek_v4.nvidia.triton_sparse import (
+    DeepseekV4TritonSparseAttention,
+)
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
 from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
@@ -766,7 +769,11 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
         )
     if backend == AttentionBackendEnum.FLASHINFER_MLA_SPARSE_DSV4:
         if device_capability is not None and device_capability.major == 12:
-            return DeepseekV4FlashInferSM120Attention
+            # FlashInfer's DeepSeek V4 sparse MLA runner currently imports on
+            # GB10/SM12x but fails at runtime in TRTLLM FMHA with
+            # "Unsupported architecture". Use the slower Triton fallback so the
+            # rest of the DSv4/DSpark path can be validated.
+            return DeepseekV4TritonSparseAttention
         return DeepseekV4FlashInferMLAAttention
     if backend in (
         AttentionBackendEnum.FLASHMLA_SPARSE,
@@ -775,7 +782,7 @@ def _select_dsv4_attn_cls(vllm_config: VllmConfig) -> type[DeepseekV4Attention]:
         return DeepseekV4FlashMLAAttention
 
     if device_capability is not None and device_capability.major == 12:
-        return DeepseekV4FlashInferSM120Attention
+        return DeepseekV4TritonSparseAttention
     return DeepseekV4FlashMLAAttention
 
 
@@ -1024,6 +1031,22 @@ class DeepseekV4Model(nn.Module):
         else:
             self._mtp_hidden_buffer = None
 
+        # DSpark draft (DeepSeek-V4-Flash-DSpark) conditions on the mean-pooled
+        # hidden states captured at config.dspark_target_layer_ids, concatenated
+        # into a single (num_tokens, n_targets * hidden_size) buffer. Only
+        # allocated for DSpark checkpoints on the last PP rank.
+        self._dspark_target_layer_ids = list(
+            getattr(config, "dspark_target_layer_ids", []) or []
+        )
+        if self._dspark_target_layer_ids and get_pp_group().is_last_rank:
+            self._dspark_hidden_buffer = torch.empty(
+                vllm_config.scheduler_config.max_num_batched_tokens,
+                len(self._dspark_target_layer_ids) * config.hidden_size,
+                dtype=vllm_config.model_config.dtype,
+            )
+        else:
+            self._dspark_hidden_buffer = None
+
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
 
@@ -1068,7 +1091,14 @@ class DeepseekV4Model(nn.Module):
             input_ids = input_ids.to(torch.int64)
 
         residual, post_mix, res_mix = None, None, None
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        capture_dspark = self._dspark_hidden_buffer is not None
+        dspark_targets = (
+            set(self._dspark_target_layer_ids) if capture_dspark else frozenset()
+        )
+        for layer_idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
                 positions,
@@ -1077,6 +1107,21 @@ class DeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
+            if layer_idx in dspark_targets:
+                # Materialize the post-mHC residual stream at this target layer
+                # and mean-pool over the hc_mult streams (reference:
+                # ``h.mean(dim=2)``). mhc_post is functional / non-destructive,
+                # so the running (hidden_states, residual, post_mix, res_mix)
+                # are left intact for the next layer.
+                pos = self._dspark_target_layer_ids.index(layer_idx)
+                full = mhc_post_tilelang(
+                    hidden_states, residual, post_mix, res_mix
+                ).mean(dim=1)
+                d = self.config.hidden_size
+                n_tok = full.shape[0]
+                self._dspark_hidden_buffer[:n_tok, pos * d : (pos + 1) * d].copy_(
+                    full
+                )
         if layer is not None:
             hidden_states = mhc_post_tilelang(
                 hidden_states, residual, post_mix, res_mix
@@ -1405,6 +1450,13 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP, DeepseekV4MixtureOfExperts):
         hc_mult * hidden_size) for the MTP draft model. Populated by
         forward(); valid after each target step."""
         return getattr(self.model, "_mtp_hidden_buffer", None)
+
+    def get_dspark_target_hidden_states(self) -> torch.Tensor | None:
+        """Concatenated mean-pooled hidden states captured at
+        config.dspark_target_layer_ids (max_num_batched_tokens,
+        n_targets * hidden_size) for the DSpark draft. Populated by forward();
+        None for non-DSpark checkpoints."""
+        return getattr(self.model, "_dspark_hidden_buffer", None)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self, skip_substrs=["mtp."])
