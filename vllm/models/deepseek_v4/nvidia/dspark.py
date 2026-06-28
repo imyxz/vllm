@@ -515,7 +515,39 @@ class DeepSeekV4DSparkMTP(nn.Module):
             if any(rest.startswith(s) for s in stage_local):
                 mapped = f"{layer_prefix}.{rest}"
             else:
-                mapped = f"{layer_prefix}.mtp_block.{rest}"
+                inner = f"{layer_prefix}.mtp_block.{rest}"
+                # Shared-expert down projection is stored as ``w2``.
+                if ".shared_experts.w2" in inner:
+                    inner = inner.replace(
+                        ".shared_experts.w2", ".shared_experts.down_proj"
+                    )
+                # Fused projections, mirroring the base DeepseekV4 loader:
+                #   attn.wq_a / attn.wkv      -> attn.fused_wqa_wkv (shards 0/1)
+                #   shared_experts.w1 / .w3   -> gate_up_proj        (shards 0/1)
+                # Without this the checkpoint's separate wq_a/wkv and shared
+                # expert w1/w3 tensors stay unmapped and the draft runs with
+                # uninitialized attention / shared-expert weights.
+                fused_mapping = (
+                    ("attn.fused_wqa_wkv", "attn.wq_a", 0),
+                    ("attn.fused_wqa_wkv", "attn.wkv", 1),
+                    ("gate_up_proj", "w1", 0),
+                    ("gate_up_proj", "w3", 1),
+                )
+                fused = False
+                for param_name, weight_name, shard_id in fused_mapping:
+                    if weight_name not in inner:
+                        continue
+                    cand = inner.replace(weight_name, param_name)
+                    param = params_dict.get(cand)
+                    if param is None:
+                        continue
+                    param.weight_loader(param, loaded_weight, shard_id)
+                    loaded_params.add(cand)
+                    fused = True
+                    break
+                if fused:
+                    continue
+                mapped = inner
 
             param = params_dict.get(mapped)
             if param is None:
