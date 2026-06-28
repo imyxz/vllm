@@ -90,9 +90,14 @@ class SpecDecodeBaseProposer:
         # DeepSeek V4 MTP consumes the target's pre-hc_head residual stream,
         # shape (T, hc_mult * hidden_size). Expand the hidden_states buffer
         # so target_hidden_states fits; detect DeepseekV4 via draft hf_config.
+        # DSpark is also a DeepSeek V4 draft, but it consumes projected
+        # mean-pooled target states with plain hidden_size, not the hc-expanded
+        # residual stream used by standard MTP.
         draft_hf_config = self.draft_model_config.hf_config
-        if hasattr(draft_hf_config, "compress_ratios") and hasattr(
-            draft_hf_config, "hc_mult"
+        if (
+            getattr(draft_hf_config, "model_type", None) != "deepseek_v4_dspark"
+            and hasattr(draft_hf_config, "compress_ratios")
+            and hasattr(draft_hf_config, "hc_mult")
         ):
             self.hidden_size = self.hidden_size * draft_hf_config.hc_mult
 
@@ -342,11 +347,13 @@ class SpecDecodeBaseProposer:
             self.parallel_drafting_token_id = model_hf_config.pard_token
         elif hasattr(model_hf_config, "ptd_token_id"):
             self.parallel_drafting_token_id = model_hf_config.ptd_token_id
+        elif hasattr(model_hf_config, "dspark_noise_token_id"):
+            self.parallel_drafting_token_id = model_hf_config.dspark_noise_token_id
         else:
             raise ValueError(
                 "For parallel drafting, the draft model config must have "
-                "`pard_token`, `ptd_token_id`, or "
-                "`dflash_config.mask_token_id` specified in its config.json."
+                "`pard_token`, `ptd_token_id`, `dspark_noise_token_id`, "
+                "or `dflash_config.mask_token_id` specified in its config.json."
             )
 
         if self.pass_hidden_states_to_model:
@@ -1328,15 +1335,21 @@ class SpecDecodeBaseProposer:
             and self.pass_hidden_states_to_model
             and self.parallel_drafting_hidden_state_tensor is not None
         ):
-            flat_mask = self.model.mask_hidden.view(-1)
-            if self.eagle3_use_aux_hidden_state:
-                # EAGLE3: mask_hidden stores all aux hidden states,
-                # project through combine_hidden_states
-                self.parallel_drafting_hidden_state_tensor.copy_(
-                    self.model.combine_hidden_states(flat_mask)
-                )
+            if hasattr(self.model, "mask_hidden"):
+                flat_mask = self.model.mask_hidden.view(-1)
+                if self.eagle3_use_aux_hidden_state:
+                    # EAGLE3: mask_hidden stores all aux hidden states,
+                    # project through combine_hidden_states
+                    self.parallel_drafting_hidden_state_tensor.copy_(
+                        self.model.combine_hidden_states(flat_mask)
+                    )
+                else:
+                    self.parallel_drafting_hidden_state_tensor.copy_(flat_mask)
             else:
-                self.parallel_drafting_hidden_state_tensor.copy_(flat_mask)
+                # DSpark overwrites every draft block slot with the per-request
+                # projected main hidden state in its proposer. Use zeros only as
+                # a temporary fill value for generic parallel-drafting input prep.
+                self.parallel_drafting_hidden_state_tensor.zero_()
 
     def _maybe_share_embeddings(self, target_language_model: nn.Module) -> None:
         """

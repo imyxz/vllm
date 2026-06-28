@@ -33,6 +33,7 @@ logger = init_logger(__name__)
 
 MTPModelTypes = Literal[
     "deepseek_mtp",
+    "deepseek_v4_dspark",
     "mimo_mtp",
     "mimo_v2_mtp",
     "glm4_moe_mtp",
@@ -330,9 +331,18 @@ class SpeculativeConfig:
             # proposes dspark_block_size tokens.
             hf_config.model_type = "deepseek_v4_dspark"
             n_predict = hf_config.dspark_block_size
+            n_mtp_layers = getattr(hf_config, "n_mtp_layers", None)
+            if not n_mtp_layers:
+                # The released HF config keeps num_nextn_predict_layers=1 for
+                # compatibility, while the reference inference config has three
+                # DSpark blocks under mtp.0/1/2. In practice that stage count
+                # matches the number of target layers used to condition DSpark.
+                n_mtp_layers = len(hf_config.dspark_target_layer_ids)
             hf_config.update(
                 {
                     "n_predict": n_predict,
+                    "n_mtp_layers": n_mtp_layers,
+                    "ptd_token_id": hf_config.dspark_noise_token_id,
                     "architectures": ["DeepSeekV4DSparkMTPModel"],
                 }
             )
@@ -772,7 +782,7 @@ class SpeculativeConfig:
                     if (
                         self.num_speculative_tokens > 1
                         and self.draft_model_config.hf_config.model_type
-                        != "step3p5_mtp"
+                        not in ("step3p5_mtp", "deepseek_v4_dspark")
                     ):
                         logger.warning(
                             "Enabling num_speculative_tokens > 1 will run "
@@ -807,7 +817,7 @@ class SpeculativeConfig:
                         self.draft_model_config.hf_config = eagle_config
                         self.update_arch_()
 
-                if self.method == "dflash":
+                if self.method == "dflash" or self.use_dspark_mtp():
                     self.parallel_drafting = True
 
                 if self.num_speculative_tokens is not None and hasattr(
@@ -832,6 +842,16 @@ class SpeculativeConfig:
                         raise ValueError(
                             f"num_speculative_tokens:{self.num_speculative_tokens}"
                             f" must be divisible by {n_predict=}"
+                        )
+                    elif (
+                        self.use_dspark_mtp()
+                        and self.num_speculative_tokens != n_predict
+                    ):
+                        raise ValueError(
+                            "DeepSeek V4 DSpark currently supports exactly one "
+                            f"draft block per step: num_speculative_tokens "
+                            f"must equal dspark_block_size ({n_predict}), got "
+                            f"{self.num_speculative_tokens}."
                         )
 
                 if self.num_speculative_tokens is None:

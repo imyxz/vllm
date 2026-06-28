@@ -19,6 +19,7 @@ class DeepseekV4Config(PretrainedConfig):
         # checkpoints are unaffected; a DSpark checkpoint sets
         # ``dspark_block_size > 0`` and a non-empty ``dspark_target_layer_ids``.
         num_nextn_predict_layers: int = 0,
+        n_mtp_layers: int | None = None,
         dspark_block_size: int = 0,
         dspark_noise_token_id: int = 0,
         dspark_target_layer_ids: list[int] | None = None,
@@ -30,6 +31,7 @@ class DeepseekV4Config(PretrainedConfig):
         self.rope_theta = rope_theta
         self.rope_parameters = rope_scaling or rope_parameters
         self.num_nextn_predict_layers = num_nextn_predict_layers
+        self.n_mtp_layers = n_mtp_layers
         self.dspark_block_size = dspark_block_size
         self.dspark_noise_token_id = dspark_noise_token_id
         self.dspark_target_layer_ids = dspark_target_layer_ids or []

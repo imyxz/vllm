@@ -14,10 +14,9 @@ of ``dspark_block_size`` tokens in a single forward pass:
   2. The draft token sequence is ``[last_verified_token, noise, noise, ...]``
      of length ``dspark_block_size``; ``noise`` is ``dspark_noise_token_id``.
      These are embedded and expanded into ``hc_mult`` Hyper-Connection streams.
-  3. A single ``DeepseekV4DecoderLayer`` (sliding-window attention + MoE + mHC)
-     processes the block conditioned on ``main_x``.
-  4. ``hc_head`` collapses the hc streams; the shared LM head produces base
-     block logits.
+  3. The ``mtp.0..n`` DSpark stages process the block conditioned on ``main_x``.
+  4. The final stage ``hc_head`` collapses the hc streams; the shared LM head
+     produces base block logits.
   5. A cheap autoregressive ``Markov`` head (vocab x ``dspark_markov_rank``)
      refines each position's logits given the previously chosen token, and a
      ``confidence`` head emits a per-position acceptance score used by the
@@ -36,12 +35,17 @@ approximation for later ones; reconciling it exactly against the reference KV
 insertion is the main item left for on-hardware validation.
 """
 
+import re
 from collections.abc import Iterable
 
 import torch
 import torch.nn as nn
 
 from vllm.config import VllmConfig
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.logger import init_logger
 from vllm.model_executor.kernels.mhc.tilelang import (
     hc_head_fused_kernel_tilelang,
@@ -61,6 +65,25 @@ from vllm.sequence import IntermediateTensors
 from .model import DeepseekV4DecoderLayer
 
 logger = init_logger(__name__)
+
+
+def _map_deepseek_v4_weight_name(name: str, expert_dtype: str) -> str:
+    """Apply the DeepSeek-V4 checkpoint-to-vLLM suffix mapping used by the
+    base model loader, without changing the mtp.* prefix handled below."""
+    if expert_dtype == "fp4":
+        name = re.sub(
+            r"(\.experts\.\d+\.w[123])\.scale$",
+            r"\1.weight_scale",
+            name,
+        )
+        name = re.sub(r"\.scale$", ".weight_scale_inv", name)
+    else:
+        name = re.sub(r"\.scale$", ".weight_scale_inv", name)
+    if name.endswith(".ffn.gate.bias"):
+        name = name.removesuffix(".ffn.gate.bias") + (
+            ".ffn.gate.e_score_correction_bias"
+        )
+    return name
 
 
 class DSparkMarkovHead(nn.Module):
@@ -122,16 +145,20 @@ class DSparkConfidenceHead(nn.Module):
 
 
 class DeepSeekV4DSparkPredictorLayer(nn.Module):
-    """The single DSpark stage (``num_nextn_predict_layers == 1``).
+    """One DSpark stage from the ``mtp.*`` checkpoint namespace.
 
-    Mirrors the reference ``DSparkBlock`` with ``stage_id == 0`` and
-    ``stage_id == n_mtp_layers - 1`` (both branches active for a single stage).
+    The released DSpark checkpoint stores three stages: ``mtp.0`` owns
+    ``main_proj``/``main_norm``, intermediate stages only own a decoder block,
+    and the final stage owns ``hc_head``/``norm``/``markov_head``/
+    ``confidence_head``.
     """
 
     def __init__(
         self,
         vllm_config: VllmConfig,
         prefix: str,
+        stage_id: int,
+        n_mtp_layers: int,
         aux_stream_list: list[torch.cuda.Stream] | None = None,
     ) -> None:
         super().__init__()
@@ -146,57 +173,68 @@ class DeepSeekV4DSparkPredictorLayer(nn.Module):
         self.noise_token_id = config.dspark_noise_token_id
         self.target_layer_ids = list(config.dspark_target_layer_ids)
         self.markov_rank = config.dspark_markov_rank
+        self.stage_id = stage_id
+        self.is_first_stage = stage_id == 0
+        self.is_last_stage = stage_id == n_mtp_layers - 1
 
-        # main_proj projects the concatenation of mean-pooled hidden states from
-        # the target layers (one ``hidden_size`` block per target layer) down to
-        # a single conditioning vector. fp8 linear quant, like the V4 e/h_proj.
-        self.main_proj = ReplicatedLinear(
-            config.hidden_size * len(self.target_layer_ids),
-            config.hidden_size,
-            bias=False,
-            return_bias=False,
-            quant_config=quant_config,
-            prefix=f"{prefix}.main_proj",
-        )
-        self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        if self.is_first_stage:
+            # main_proj projects the concatenation of mean-pooled hidden states
+            # from the target layers down to one conditioning vector.
+            self.main_proj = ReplicatedLinear(
+                config.hidden_size * len(self.target_layer_ids),
+                config.hidden_size,
+                bias=False,
+                return_bias=False,
+                quant_config=quant_config,
+                prefix=f"{prefix}.main_proj",
+            )
+            self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
-        # Hyper-Connection head params (collapse hc_mult streams -> 1).
         self.hc_eps = config.hc_eps
         self.hc_mult = config.hc_mult
         self.hc_dim = self.hc_mult * config.hidden_size
-        self.hc_head_fn = nn.Parameter(
-            torch.empty(self.hc_mult, self.hc_dim, dtype=torch.float32),
-            requires_grad=False,
-        )
-        self.hc_head_base = nn.Parameter(
-            torch.empty(self.hc_mult, dtype=torch.float32), requires_grad=False
-        )
-        self.hc_head_scale = nn.Parameter(
-            torch.empty(1, dtype=torch.float32), requires_grad=False
-        )
 
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.mtp_block = DeepseekV4DecoderLayer(
             vllm_config,
             prefix,
             aux_stream_list=aux_stream_list,
         )
 
-        self.markov_head = DSparkMarkovHead(config, prefix=f"{prefix}.markov_head")
-        self.confidence_head = DSparkConfidenceHead(
-            config.hidden_size + self.markov_rank,
-            prefix=f"{prefix}.confidence_head",
-        )
+        if self.is_last_stage:
+            # Hyper-Connection head params (collapse hc_mult streams -> 1).
+            self.hc_head_fn = nn.Parameter(
+                torch.empty(self.hc_mult, self.hc_dim, dtype=torch.float32),
+                requires_grad=False,
+            )
+            self.hc_head_base = nn.Parameter(
+                torch.empty(self.hc_mult, dtype=torch.float32), requires_grad=False
+            )
+            self.hc_head_scale = nn.Parameter(
+                torch.empty(1, dtype=torch.float32), requires_grad=False
+            )
+
+            self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.markov_head = DSparkMarkovHead(
+                config, prefix=f"{prefix}.markov_head"
+            )
+            self.confidence_head = DSparkConfidenceHead(
+                config.hidden_size + self.markov_rank,
+                prefix=f"{prefix}.confidence_head",
+            )
 
 
 class DeepSeekV4DSparkPredictor(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
-        config = vllm_config.model_config.hf_config
+        assert vllm_config.speculative_config is not None
+        config = vllm_config.speculative_config.draft_model_config.hf_config
         self.config = config
         self.mtp_start_layer_idx = config.num_hidden_layers
-        # DSpark uses a single block stage.
-        self.num_mtp_layers = config.num_nextn_predict_layers
+        self.num_mtp_layers = (
+            getattr(config, "n_mtp_layers", None)
+            or len(getattr(config, "dspark_target_layer_ids", []) or [])
+            or getattr(config, "num_nextn_predict_layers", 1)
+        )
         self.block_size = config.dspark_block_size
         self.noise_token_id = config.dspark_noise_token_id
 
@@ -206,6 +244,8 @@ class DeepSeekV4DSparkPredictor(nn.Module):
                 str(idx): DeepSeekV4DSparkPredictorLayer(
                     vllm_config,
                     f"{prefix}.layers.{idx}",
+                    stage_id=idx - self.mtp_start_layer_idx,
+                    n_mtp_layers=self.num_mtp_layers,
                     aux_stream_list=aux_stream_list,
                 )
                 for idx in range(
@@ -227,12 +267,15 @@ class DeepSeekV4DSparkPredictor(nn.Module):
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
 
-    def _stage(self) -> DeepSeekV4DSparkPredictorLayer:
+    def _first_stage(self) -> DeepSeekV4DSparkPredictorLayer:
         return self.layers[str(self.mtp_start_layer_idx)]
+
+    def _last_stage(self) -> DeepSeekV4DSparkPredictorLayer:
+        return self.layers[str(self.mtp_start_layer_idx + self.num_mtp_layers - 1)]
 
     def project_main_hidden(self, main_hidden: torch.Tensor) -> torch.Tensor:
         """``main_x = main_norm(main_proj(concat of target-layer hiddens))``."""
-        stage = self._stage()
+        stage = self._first_stage()
         return stage.main_norm(stage.main_proj(main_hidden))
 
     def forward(
@@ -248,15 +291,24 @@ class DeepSeekV4DSparkPredictor(nn.Module):
 
         Returns the pre-hc_head residual ``(T, hc_mult * hidden_size)``.
         """
-        stage = self._stage()
+        first_stage = self._first_stage()
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
         hidden_states = inputs_embeds + main_x
         # Expand to hc_mult Hyper-Connection streams (V4 residual layout).
-        hidden_states = hidden_states.unsqueeze(-2).repeat(1, stage.hc_mult, 1)
-        hidden_states, residual, post_mix, res_mix = stage.mtp_block(
-            x=hidden_states, positions=positions, input_ids=None
+        hidden_states = hidden_states.unsqueeze(-2).repeat(
+            1, first_stage.hc_mult, 1
         )
+        residual, post_mix, res_mix = None, None, None
+        for stage in self.layers.values():
+            hidden_states, residual, post_mix, res_mix = stage.mtp_block(
+                x=hidden_states,
+                positions=positions,
+                input_ids=None,
+                post_mix=post_mix,
+                res_mix=res_mix,
+                residual=residual,
+            )
         hidden_states = mhc_post_tilelang(hidden_states, residual, post_mix, res_mix)
         return hidden_states.flatten(1)
 
@@ -270,7 +322,7 @@ class DeepSeekV4DSparkPredictor(nn.Module):
         confidence head consumes the un-normed ``x``, so the un-normed hc_head
         output is returned for the confidence head.
         """
-        stage = self._stage()
+        stage = self._last_stage()
         hidden_states = hidden_states.view(-1, stage.hc_mult, stage.hidden_size)
         x = hc_head_fused_kernel_tilelang(
             hidden_states,
@@ -294,7 +346,8 @@ class DeepSeekV4DSparkMTP(nn.Module):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
-        self.config = vllm_config.model_config.hf_config
+        assert vllm_config.speculative_config is not None
+        self.config = vllm_config.speculative_config.draft_model_config.hf_config
         self.quant_config = vllm_config.quant_config
         self.block_size = self.config.dspark_block_size
         self.noise_token_id = self.config.dspark_noise_token_id
@@ -337,12 +390,12 @@ class DeepSeekV4DSparkMTP(nn.Module):
         self, prev_token_ids: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """One Markov step: ``(logits_bias, markov_embed)`` for ``prev_token_ids``."""
-        return self.model._stage().markov_head(prev_token_ids)
+        return self.model._last_stage().markov_head(prev_token_ids)
 
     def compute_confidence(
         self, collapsed_hidden: torch.Tensor, markov_embed: torch.Tensor
     ) -> torch.Tensor:
-        return self.model._stage().confidence_head(collapsed_hidden, markov_embed)
+        return self.model._last_stage().confidence_head(collapsed_hidden, markov_embed)
 
     # ----- weight loading -------------------------------------------------
 
@@ -351,12 +404,11 @@ class DeepSeekV4DSparkMTP(nn.Module):
 
         Checkpoint layout (reference ``DSparkBlock`` under ``mtp.{i}.``):
           * ``mtp.0.main_proj`` / ``mtp.0.main_norm``
-          * ``mtp.0.attn.*`` / ``mtp.0.ffn.*`` -> ``mtp_block.{attn,ffn}.*``
-          * ``mtp.0.attn_norm`` / ``mtp.0.ffn_norm`` -> ``mtp_block.*``
-          * ``mtp.0.hc_*`` (block) -> ``mtp_block.hc_*``;
-            ``mtp.0.hc_head_*`` (head) -> stage ``hc_head_*``
-          * ``mtp.0.norm`` (final) -> stage ``norm``
-          * ``mtp.0.markov_head.{markov_w1,markov_w2}`` / ``mtp.0.confidence_head.proj``
+          * ``mtp.{i}.attn.*`` / ``mtp.{i}.ffn.*`` ->
+            ``layers.{num_hidden_layers+i}.mtp_block.{attn,ffn}.*``
+          * ``mtp.{i}.attn_norm`` / ``mtp.{i}.ffn_norm`` -> ``mtp_block.*``
+          * ``mtp.{last}.hc_head_*`` / ``norm`` / ``markov_head`` /
+            ``confidence_head`` -> final stage-local params
 
         The base vocab embedding and LM head are *shared* with the target model
         (the reference ties ``mtp[-1].embed``/``head`` to the base; convert.py
@@ -372,6 +424,12 @@ class DeepSeekV4DSparkMTP(nn.Module):
         start = config.num_hidden_layers
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        expert_dtype = getattr(config, "expert_dtype", "fp4")
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        n_local_head = config.num_attention_heads // tp_size
+        head_rank_start = n_local_head * tp_rank
+        head_rank_end = n_local_head * (tp_rank + 1)
 
         expert_mapping = make_deepseek_v4_expert_params_mapping(
             config.n_routed_experts
@@ -391,6 +449,8 @@ class DeepSeekV4DSparkMTP(nn.Module):
         shared_top = {"embed": "model.embed_tokens", "head": "model.head"}
 
         for name, loaded_weight in weights:
+            orig_name = name
+            name = _map_deepseek_v4_weight_name(name, expert_dtype)
             # Shared (tied) vocab embedding + LM head come from the base model
             # weights in the same checkpoint iterator.
             base_shared = None
@@ -459,7 +519,17 @@ class DeepSeekV4DSparkMTP(nn.Module):
 
             param = params_dict.get(mapped)
             if param is None:
-                logger.warning_once("DSpark: unmapped checkpoint weight %s", name)
+                logger.warning_once(
+                    "DSpark: unmapped checkpoint weight %s (mapped from %s)",
+                    name,
+                    orig_name,
+                )
+                continue
+            if "attn.attn_sink" in mapped:
+                narrow_weight = loaded_weight[head_rank_start:head_rank_end]
+                n = narrow_weight.shape[0]
+                param[:n].copy_(narrow_weight)
+                loaded_params.add(mapped)
                 continue
             weight_loader = getattr(param, "weight_loader", default_weight_loader)
             weight_loader(param, loaded_weight)
