@@ -49,6 +49,7 @@ MTPModelTypes = Literal[
     "mtp",
     "pangu_ultra_moe_mtp",
     "step3p5_mtp",
+    "deepseek_v4_dspark",
     "hy_v3_mtp",
     "gemma4_mtp",
 ]
@@ -772,7 +773,7 @@ class SpeculativeConfig:
                     if (
                         self.num_speculative_tokens > 1
                         and self.draft_model_config.hf_config.model_type
-                        != "step3p5_mtp"
+                        not in ("step3p5_mtp", "deepseek_v4_dspark")
                     ):
                         logger.warning(
                             "Enabling num_speculative_tokens > 1 will run "
